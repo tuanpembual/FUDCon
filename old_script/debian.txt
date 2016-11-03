@@ -1,0 +1,211 @@
+s.id/aeg
+
+* Gambar cara kerja
+
+* praktek install ELK
+
+Server
+
+- Install Java 8
+
+sudo add-apt-repository -y ppa:webupd8team/java
+sudo apt-get update
+sudo apt-get -y install oracle-java8-installer
+
+- Install Elasticsearch
+
+wget -qO - https://packages.elastic.co/GPG-KEY-elasticsearch | sudo apt-key add -
+echo "deb http://packages.elastic.co/elasticsearch/2.x/debian stable main" | sudo tee -a /etc/apt/sources.list.d/elasticsearch-2.x.list
+sudo apt-get update
+sudo apt-get -y install elasticsearch
+
+sudo vim /etc/elasticsearch/elasticsearch.yml
+
+Find the line that specifies network.host, uncomment it, and replace its value with "localhost" 
+network.host: localhost
+
+sudo service elasticsearch restart
+sudo update-rc.d elasticsearch defaults 95 10
+
+- Install Kibana
+
+echo "deb http://packages.elastic.co/kibana/4.4/debian stable main" | sudo tee -a /etc/apt/sources.list.d/kibana-4.4.x.list
+sudo apt-get update
+sudo apt-get -y install kibana
+
+sudo vim /opt/kibana/config/kibana.yml
+
+Find the line that specifies server.host, and replace the IP address ("0.0.0.0" by default) with "localhost":
+server.host: "localhost"
+
+sudo update-rc.d kibana defaults 96 9
+sudo service kibana start
+
+- Install Nginx
+
+sudo apt-get -y install nginx apache2-utils
+sudo htpasswd -c /etc/nginx/htpasswd.users kibanaadmin
+
+sudo vim /etc/nginx/sites-available/default
+    
+    server {
+        listen 80;
+
+        server_name 192.168.98.101;
+
+        auth_basic "Restricted Access";
+        auth_basic_user_file /etc/nginx/htpasswd.users;
+
+        location / {
+            proxy_pass http://localhost:5601;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_cache_bypass $http_upgrade;        
+        }
+    }
+
+sudo service nginx restart
+
+- Install Logstash
+
+echo 'deb http://packages.elastic.co/logstash/2.2/debian stable main' | sudo tee /etc/apt/sources.list.d/logstash-2.2.x.list
+sudo apt-get update
+sudo apt-get install logstash
+
+- Generate SSL Certificates
+
+sudo mkdir -p /etc/pki/tls/certs
+sudo mkdir /etc/pki/tls/private
+sudo vim /etc/ssl/openssl.cnf
+
+subjectAltName = IP: ELK_server_private_IP
+
+cd /etc/pki/tls
+sudo openssl req -config /etc/ssl/openssl.cnf -x509 -days 3650 -batch -nodes -newkey rsa:2048 -keyout private/logstash-forwarder.key -out certs/logstash-forwarder.crt
+
+- Configure Logstash
+
+sudo vim /etc/logstash/conf.d/02-beats-input.conf
+    input {
+      beats {
+        port => 5044
+        ssl => true
+        ssl_certificate => "/etc/pki/tls/certs/logstash-forwarder.crt"
+        ssl_key => "/etc/pki/tls/private/logstash-forwarder.key"
+      }
+    }
+
+sudo vim /etc/logstash/conf.d/10-syslog-filter.conf
+    filter {
+      if [type] == "syslog" {
+        grok {
+          match => { "message" => "%{SYSLOGTIMESTAMP:syslog_timestamp} %{SYSLOGHOST:syslog_hostname} %{DATA:syslog_program}(?:\[%{POSINT:syslog_pid}\])?: %{GREEDYDATA:syslog_message}" }
+          add_field => [ "received_at", "%{@timestamp}" ]
+          add_field => [ "received_from", "%{host}" ]
+        }
+        syslog_pri { }
+        date {
+          match => [ "syslog_timestamp", "MMM  d HH:mm:ss", "MMM dd HH:mm:ss" ]
+        }
+      }
+    }
+
+sudo vim /etc/logstash/conf.d/30-elasticsearch-output.conf
+    output {
+      elasticsearch {
+        hosts => ["localhost:9200"]
+        sniffing => true
+        manage_template => false
+        index => "%{[@metadata][beat]}-%{+YYYY.MM.dd}"
+        document_type => "%{[@metadata][type]}"
+      }
+    }
+
+sudo service logstash configtest
+sudo service logstash restart
+sudo update-rc.d logstash defaults 96 9
+
+* Load Kibana Dashboards
+
+cd ~
+curl -L -O https://download.elastic.co/beats/dashboards/beats-dashboards-1.1.0.zip
+sudo apt-get -y install unzip
+unzip beats-dashboards-*.zip
+
+cd beats-dashboards-*
+./load.sh
+
+cd ~
+curl -O https://gist.githubusercontent.com/thisismitch/3429023e8438cc25b86c/raw/d8c479e2a1adcea8b1fe86570e42abab0f10f364/filebeat-index-template.json
+curl -XPUT 'http://localhost:9200/_template/filebeat?pretty' -d@filebeat-index-template.json
+
+Output:
+{
+  "acknowledged" : true
+}
+
+* ELK Client
+
+scp /etc/pki/tls/certs/logstash-forwarder.crt user@client_server_private_address:/tmp
+sudo mkdir -p /etc/pki/tls/certs
+sudo cp /tmp/logstash-forwarder.crt /etc/pki/tls/certs/
+
+x`x
+
+echo "deb https://packages.elastic.co/beats/apt stable main" |  sudo tee -a /etc/apt/sources.list.d/beats.list
+wget -qO - https://packages.elastic.co/GPG-KEY-elasticsearch | sudo apt-key add -
+
+sudo apt-get update
+sudo apt-get install filebeat
+
+sudo vim /etc/filebeat/filebeat.yml
+
+############################# Filebeat ######################################
+filebeat:
+  prospectors:
+    -
+      paths:
+        - /var/log/syslog
+
+      input_type: sylog
+
+      document_type: development
+
+  registry_file: /var/lib/filebeat/registry
+output:
+
+  logstash:
+    hosts: ["10.0.0.10:5044"]
+    bulk_max_size: 1024
+
+    tls:
+      certificate_authorities: ["/etc/pki/tls/certs/logstash-forwarder.crt"]
+
+shipper:
+
+logging:
+  files:
+    rotateeverybytes: 10485760 # = 10MB
+
+#######
+
+sudo service filebeat restart
+sudo update-rc.d filebeat defaults 95 10
+
+* Testing
+curl -XGET 'http://localhost:9200/filebeat-*/_search?pretty'
+
+Sample Output:
+...
+{
+      "_index" : "filebeat-2016.01.29",
+      "_type" : "log",
+      "_id" : "AVKO98yuaHvsHQLa53HE",
+      "_score" : 1.0,
+      "_source":{"message":"Feb  3 14:34:00 rails sshd[963]: Server listening on :: port 22.","@version":"1","@timestamp":"2016-01-29T19:59:09.145Z","beat":{"hostname":"topbeat-u-03","name":"topbeat-u-03"},"count":1,"fields":null,"input_type":"log","offset":70,"source":"/var/log/auth.log","type":"log","host":"topbeat-u-03"}
+    }
+...
+
+## Lets Use Kibana Dashboard
