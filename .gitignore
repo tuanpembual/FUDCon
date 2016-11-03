@@ -1,0 +1,11 @@
+.DS_store
+.vagrant
+*~
+*#
+.#*
+\#*#
+.*.sw[a-z]
+*.un~
+
+elk
+package
